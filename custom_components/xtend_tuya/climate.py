@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import cast, Self
 from homeassistant.components.climate.const import (
     HVACMode,
+    HVACAction,  # <--- AGGIUNTO
     SWING_OFF,
     SWING_ON,
     SWING_HORIZONTAL,
@@ -77,6 +78,16 @@ XT_CLIMATE_MODE_DPCODES: tuple[XTDPCode, ...] = (
     XTDPCode.MODE,
     XTDPCode.MODE1,
 )
+
+# --- NUOVO BLOCCO PER GESTIRE L'AZIONE (Heating/Idle) ---
+XT_CLIMATE_ACTION_DPCODES: tuple[XTDPCode, ...] = (
+    XTDPCode.WORK_STATE,   # DP 19 (Verifica che sia nel tuo const.py)
+    XTDPCode.WORK_MODE,
+    XTDPCode.WORK_STATUS,
+)
+# --------------------------------------------------------
+
+
 XT_CLIMATE_CURRENT_NON_UNIT_TEMPERATURE_DPCODES: tuple[XTDPCode, ...] = (
     XTDPCode.GET_TEMP,
 )
@@ -185,6 +196,8 @@ class XTClimateEntityDescription(TuyaClimateEntityDescription):
         switch_wrapper: TuyaDPCodeBooleanWrapper | None,
         target_humidity_wrapper: TuyaClimateRoundedIntegerWrapper | None,
         temperature_unit: UnitOfTemperature,
+        # AGGIUNTO wrapper per l'azione
+        action_wrapper: TuyaDPCodeEnumWrapper | None = None,
     ) -> XTClimateEntity:
         return XTClimateEntity(
             device=device,
@@ -200,6 +213,7 @@ class XTClimateEntityDescription(TuyaClimateEntityDescription):
             switch_wrapper=switch_wrapper,
             target_humidity_wrapper=target_humidity_wrapper,
             temperature_unit=temperature_unit,
+            action_wrapper=action_wrapper, # Passiamo il wrapper
         )
 
 
@@ -241,7 +255,7 @@ class XTClimatePresetWrapper(TuyaClimatePresetWrapper):
         self.options = [
             tuya_mode for tuya_mode, ha_mode in mappings.items() if ha_mode is None
         ]
-    
+
     def read_device_status(self, device: TuyaCustomerDevice) -> str | None:
         """Read the device status."""
         if (raw := super(TuyaClimatePresetWrapper, self).read_device_status(device)) in XT_HVAC_TO_HA:
@@ -256,7 +270,7 @@ class XTClimateHvacModeWrapper(TuyaClimateHvacModeWrapper):
         self.options = [
             ha_mode for ha_mode in self._mappings.values() if ha_mode is not None
         ]
-    
+
     def read_device_status(self, device: TuyaCustomerDevice) -> HVACMode | None:
         """Read the device status."""
         if (raw := super(TuyaClimateHvacModeWrapper, self).read_device_status(device)) not in XT_HVAC_TO_HA:
@@ -444,6 +458,11 @@ async def async_setup_entry(
                                 prefer_function=True,
                             ),
                             temperature_unit=temperature_wrappers[2],
+                              # AGGIUNTO: Trova il DP per l'azione (work_state)
+                            action_wrapper=TuyaDPCodeEnumWrapper.find_dpcode(
+                                device,
+                                XT_CLIMATE_ACTION_DPCODES, # type: ignore
+                            ),
                         )
                     )
         async_add_entities(entities)
@@ -471,6 +490,7 @@ class XTClimateEntity(XTEntity, TuyaClimateEntity):
         SWING_MODE_HORIZONTAL = "swing_mode_horizontal"  # Swing horizontaly
         SWING_MODE_VERTICAL = "swing_mode_vertical"  # Swing verticaly
         SWITCH_ON = "switch_on"  # Switch on device
+        ACTION = "work_state"
 
     def __init__(
         self,
@@ -488,12 +508,16 @@ class XTClimateEntity(XTEntity, TuyaClimateEntity):
         switch_wrapper: TuyaDPCodeBooleanWrapper | None,
         target_humidity_wrapper: TuyaClimateRoundedIntegerWrapper | None,
         temperature_unit: UnitOfTemperature,
+        # AGGIUNTO
+        action_wrapper: TuyaDPCodeEnumWrapper | None = None,
     ) -> None:
         """Determine which values to use."""
         device_manager.device_watcher.report_message(
             device.id,
             f"Creating XTClimateEntity for device {device.name} ({device.id}), wrappers: cur_temp({current_temperature_wrapper.dpcode if current_temperature_wrapper else 'None'}), set_temp({set_temperature_wrapper.dpcode if set_temperature_wrapper else 'None'}), hvac_mode({hvac_mode_wrapper.dpcode if hvac_mode_wrapper else 'None'}), fan_mode({fan_mode_wrapper.dpcode if fan_mode_wrapper else 'None'})",
         )
+         # Salva il wrapper dell'azione
+        self._action_wrapper = action_wrapper
         super(XTClimateEntity, self).__init__(device, device_manager, description)
         super(XTEntity, self).__init__(
             device,
@@ -513,6 +537,37 @@ class XTClimateEntity(XTEntity, TuyaClimateEntity):
         self.device = device
         self.device_manager = device_manager
         self.entity_description = description
+     # AGGIUNTO: Sovrascrivi hvac_action per leggere lo stato reale (heating vs idle)
+    @property
+    def hvac_action(self) -> HVACAction | None:
+        """Return the current running hvac operation if supported."""
+        # Verifichiamo se abbiamo trovato un wrapper per l'azione durante il discovery
+        if self._action_wrapper:
+            # Il wrapper contiene il codice DP (es. "work_state"), non il valore.
+            # Dobbiamo chiedere al device qual è lo stato attuale di quel DP.
+            status = self.device.status.get(self._action_wrapper.dpcode)
+
+            # Se lo status è None (device offline o dato mancante), usciamo
+            if status is None:
+                return super().hvac_action
+
+            # Mappatura dei valori grezzi Tuya -> Home Assistant HVACAction
+            # Nota: assicurati che questi valori (heating, warming, etc) coincidano
+            # esattamente con quelli visti nei log (sono case-sensitive).
+            if status in ["heating", "warming", "opened", "heat"]:
+                return HVACAction.HEATING
+            if status in ["cooling", "cool"]:
+                return HVACAction.COOLING
+            if status in ["stop", "closed", "off", "idle", "standby", "ventilation"]:
+                return HVACAction.IDLE
+            if status in ["drying", "wet"]:
+                return HVACAction.DRY
+            if status in ["fan", "wind"]:
+                return HVACAction.FAN
+
+        # Fallback al comportamento standard se non c'è il DP work_state
+        return super().hvac_action
+
 
     @staticmethod
     def get_entity_instance(
@@ -530,6 +585,8 @@ class XTClimateEntity(XTEntity, TuyaClimateEntity):
         switch_wrapper: TuyaDPCodeBooleanWrapper | None,
         target_humidity_wrapper: TuyaClimateRoundedIntegerWrapper | None,
         temperature_unit: UnitOfTemperature,
+        # AGGIUNTO nei parametri
+        action_wrapper: TuyaDPCodeEnumWrapper | None = None,
     ) -> XTClimateEntity:
         if hasattr(description, "get_entity_instance") and callable(
             getattr(description, "get_entity_instance")
@@ -548,6 +605,7 @@ class XTClimateEntity(XTEntity, TuyaClimateEntity):
                 switch_wrapper=switch_wrapper,
                 target_humidity_wrapper=target_humidity_wrapper,
                 temperature_unit=temperature_unit,
+                action_wrapper=action_wrapper, # Passaggio parametro
             )
         return XTClimateEntity(
             device,
@@ -563,4 +621,5 @@ class XTClimateEntity(XTEntity, TuyaClimateEntity):
             switch_wrapper=switch_wrapper,
             target_humidity_wrapper=target_humidity_wrapper,
             temperature_unit=temperature_unit,
+            action_wrapper=action_wrapper, # Passaggio parametro
         )
